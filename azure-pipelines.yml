@@ -1,0 +1,105 @@
+trigger:
+- main  
+
+stages:
+- stage: BuildTest
+  jobs:
+  - job: BuildTestJob
+    pool:
+      vmImage: 'ubuntu-latest' 
+    steps:
+     - task: UsePythonVersion@0
+       inputs:
+        versionSpec: '$(pythonVersion)'
+        architecture: 'x64'
+
+     - script: |
+        python -m pip install --upgrade pip
+        cd src/
+        pip install -r requirements.txt
+       displayName: 'Install dependencies'
+
+     - script: |
+        pip install pytest
+        cd src/
+        pytest --junitxml=../reports/flask-report.xml
+       displayName: 'Run tests'
+
+     - task: PublishTestResults@2
+       inputs:
+        testResultsFiles: 'reports/flask-report.xml'
+        testRunTitle: '$(Agent.OS) - $(Build.BuildNumber)[$(Agent.JobName)] - Python $(python.version)'
+       condition: succeededOrFailed()   
+
+- stage: ConvertImage
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: ConvertImageJob
+    pool:
+      vmImage: 'ubuntu-latest' 
+    steps:
+    - task: Docker@2
+      inputs:
+        containerRegistry: 'yourACRServiceConnection' 
+        repository: 'pythonapplication' 
+        command: 'buildAndPush'
+        Dockerfile: 'Dockerfile' 
+        tags: 'latest'
+- stage: TestImage
+  dependsOn: ConvertImage
+  jobs:
+   - job: TestForVuln
+     pool:
+      vmImage: 'ubuntu-latest'
+     steps:
+     - script: |
+         docker pull pythonapplication:latest
+         trivyOutput=$(trivy yourImage:tag --format=json)
+         echo "$trivyOutput" > trivy-output.json
+         trivyExitCode=$(echo "$trivyOutput" | jq '.[0].Vulnerabilities[] | select(.Severity | contains("CRITICAL"))')
+         if [ -z "$trivyExitCode" ]; then
+           echo "No critical vulnerabilities found."
+         else
+          echo "Critical vulnerabilities found. Exiting the pipeline."
+          exit 1
+         fi
+       displayName: 'Scan and check for critical vulnerabilities' 
+- stage: DeployToStageEnv
+  dependsOn: TestImage
+  condition: succeeded()
+  jobs:
+  - deployment: DeployToAKSJob
+    pool:
+      vmImage: 'ubuntu-latest'
+    environment: 'AKSStageEnvironment' 
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              cd manifests/
+              kubectl apply -f *.yaml
+            displayName: 'Deploy to AKS'       
+- stage: DeployToProdEnv
+  dependsOn: DeployToStageEnv
+  jobs: 
+  - deployment: DeployToAKSJob
+    pool:
+     vmImage: 'ubuntu-latest'
+    environment: 'AKSProdEnvironment' 
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              cd manifests/
+              kubectl apply -f *.yaml
+            displayName: 'Deploy to AKS' 
+          - task: ManualValidation@0
+            displayName: 'Manual approval'
+            inputs:
+              notifyUsers: |
+                rakrakshith77@gmail.com 
+              instructions: 'Please approve the deployment to Production cluster.'
+              onTimeout: 'reject'  
